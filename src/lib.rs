@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 /// KvStore is an in-memory key-value store.
+#[derive(Default)]
 pub struct KvStore {
     m: HashMap<String, String>,
 }
