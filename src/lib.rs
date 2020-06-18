@@ -1,37 +1,35 @@
 //! kvs provides a key-vale store in memory.
 #![deny(missing_docs)]
-use std::collections::HashMap;
+use std::path::Path;
 
 /// KvStore is an in-memory key-value store.
 #[derive(Default)]
-pub struct KvStore {
-    m: HashMap<String, String>,
-}
+pub struct KvStore {}
 
 impl KvStore {
-    /// Create a key-value store.
-    pub fn new() -> KvStore {
-        KvStore { m: HashMap::new() }
+    /// Open a key-value store from a file at path.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<KvStore> {
+        unimplemented!()
     }
 
     /// Set a value associated with key.
-    pub fn set(&mut self, key: String, value: String) {
-        self.m.insert(key, value);
+    pub fn set(&mut self, key: String, value: String) -> Result<()> {
+        unimplemented!()
     }
 
     /// Get a value by key.
-    pub fn get(&mut self, key: String) -> Option<String> {
-        match self.m.get(&key) {
-            Some(value) => Some(value.clone()),
-            None => None,
-        }
+    pub fn get(&mut self, key: String) -> Result<Option<String>> {
+        unimplemented!()
     }
 
     /// Remove a value by key.
-    pub fn remove(&mut self, key: String) {
-        self.m.remove(&key);
+    pub fn remove(&mut self, key: String) -> Result<()> {
+        unimplemented!()
     }
 }
+
+/// Result type for kvs.
+pub type Result<T> = std::result::Result<T, String>;
 
 #[cfg(test)]
 mod tests {
