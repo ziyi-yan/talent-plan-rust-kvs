@@ -29,7 +29,11 @@ impl KvStore {
 }
 
 /// Result type for kvs.
-pub type Result<T> = std::result::Result<T, String>;
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Error type for kvs.
+#[derive(Debug)]
+pub enum Error {}
 
 #[cfg(test)]
 mod tests {
