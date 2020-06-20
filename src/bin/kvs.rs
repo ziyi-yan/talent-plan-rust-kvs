@@ -16,11 +16,20 @@ fn main() -> Result<()> {
         Opt::Set { key, value } => {
             kvs.set(key, value)?;
         }
-        Opt::Get { key } => {
-            kvs.get(key)?;
-        }
+        Opt::Get { key } => match kvs.get(key)? {
+            Some(value) => println!("{}", value),
+            None => println!("Key not found"),
+        },
         Opt::Rm { key } => {
-            kvs.remove(key)?;
+            if let Err(err) = kvs.remove(key) {
+                match err {
+                    kvs::Error::KeyNotFound => {
+                        println!("Key not found");
+                        std::process::exit(1)
+                    }
+                    _ => {}
+                }
+            }
         }
     }
     Ok(())
