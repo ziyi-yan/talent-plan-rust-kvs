@@ -1,15 +1,15 @@
 //! kvs provides a key-vale store in memory.
 #![deny(missing_docs)]
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::prelude::*;
-use std::path::Path;
+use std::io::{self, prelude::*};
+use std::{fs, path::Path};
 
 /// KvStore is an in-memory key-value store.
 pub struct KvStore {
     datafile: std::path::PathBuf,
-    bw: std::io::BufWriter<std::fs::File>,
-    index: BTreeMap<String, String>,
+    w: io::BufWriter<fs::File>,
+    /// a map from key to log pointer which is  represented as a file offset.
+    index: BTreeMap<String, u64>,
 }
 
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,7 @@ impl KvStore {
             .open(&datafile)?;
         Ok(KvStore {
             datafile,
-            bw: std::io::BufWriter::new(file),
+            w: io::BufWriter::new(file),
             index: BTreeMap::new(),
         })
     }
@@ -44,14 +44,37 @@ impl KvStore {
     /// Commands are serialized in JSON format for easier debugging.
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
         let log = Command::Set { key, value };
-        serde_json::to_writer(&mut self.bw, &log)?;
+        serde_json::to_writer(&mut self.w, &log)?;
         Ok(())
     }
 
     /// Get a value by key.
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
         self.build_index()?;
-        Ok(self.index.get(&key).cloned())
+        let op = self.index.get(&key);
+        let p = match op {
+            Some(p) => p.clone(),
+            None => {
+                return Ok(None);
+            }
+        };
+        let mut file = fs::File::open(&self.datafile)?;
+        file.seek(io::SeekFrom::Start(p))?;
+        let mut stream = serde_json::Deserializer::from_reader(&file).into_iter::<Command>();
+        let command = match stream.next() {
+            Some(result) => result?,
+            None => return Err(Error::UnexpectedError),
+        };
+
+        if let Command::Set { key: k, value: v } = command {
+            if k != key {
+                Ok(None)
+            } else {
+                Ok(Some(v))
+            }
+        } else {
+            Err(Error::UnexpectedError)
+        }
     }
 
     /// Remove a value by key.
@@ -60,7 +83,7 @@ impl KvStore {
         match self.index.get(&key) {
             Some(_) => {
                 let log = Command::Rm { key };
-                serde_json::to_writer(&mut self.bw, &log)?;
+                serde_json::to_writer(&mut self.w, &log)?;
                 Ok(())
             }
             None => Err(Error::KeyNotFound),
@@ -68,19 +91,21 @@ impl KvStore {
     }
 
     fn build_index(&mut self) -> Result<()> {
-        self.bw.flush()?;
-        let file = fs::File::open(&self.datafile)?;
-        let de = serde_json::Deserializer::from_reader(&file);
-        for command in de.into_iter::<Command>() {
+        self.w.flush()?;
+        let mut file = fs::File::open(&self.datafile)?;
+        let mut stream = serde_json::Deserializer::from_reader(&mut file).into_iter::<Command>();
+        let mut offset = stream.byte_offset() as u64;
+        while let Some(command) = stream.next() {
             let command = command?;
             match command {
-                Command::Set { key, value } => {
-                    self.index.insert(key, value);
+                Command::Set { key, value: _ } => {
+                    self.index.insert(key, offset as u64);
                 }
                 Command::Rm { key } => {
                     self.index.remove(&key);
                 }
             }
+            offset = stream.byte_offset() as u64;
         }
         Ok(())
     }
@@ -96,13 +121,16 @@ use thiserror::Error;
 pub enum Error {
     /// IO error.
     #[error("`IO error occurred: {0}`")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     /// Serde error.
     #[error("Serde error occurred: {0}")]
     Serde(#[from] serde_json::Error),
     /// Key is not found.
     #[error("Key not found")]
     KeyNotFound,
+    /// Unexpected error.
+    #[error("Unexpected error")]
+    UnexpectedError,
 }
 
 #[cfg(test)]
