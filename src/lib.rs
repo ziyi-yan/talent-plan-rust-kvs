@@ -10,6 +10,7 @@ pub struct KvStore {
     writer: PositionedWriter<io::BufWriter<fs::File>>,
     /// a map from key to log pointer which is  represented as a file offset.
     index: BTreeMap<String, u64>,
+    num_dead_keys: u64,
 }
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,8 @@ enum Command {
 }
 
 const DATA_FILE_NAME: &str = "datafile";
+
+const COMPACTION_DEAD_KEYS_RATIO: f64 = 0.4;
 
 impl KvStore {
     /// Opens a `KvStore` from the directory at path.
@@ -37,7 +40,7 @@ impl KvStore {
             .open(&datafile)?;
         let offset = file.seek(io::SeekFrom::End(0))?;
 
-        build_index(&datafile, &mut index)?;
+        let num_dead_keys = build_index(&datafile, &mut index)?;
 
         Ok(KvStore {
             datafile,
@@ -46,6 +49,7 @@ impl KvStore {
                 offset,
             },
             index,
+            num_dead_keys,
         })
     }
 
@@ -57,7 +61,10 @@ impl KvStore {
         let offset = self.writer.offset;
         serde_json::to_writer(&mut self.writer, &command)?;
         if let Command::Set { key, .. } = command {
-            self.index.insert(key, offset);
+            if let Some(_) = self.index.insert(key, offset) {
+                self.num_dead_keys += 1;
+                self.compact()?;
+            }
         }
         Ok(())
     }
@@ -65,30 +72,7 @@ impl KvStore {
     /// Get a value by key.
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
         self.writer.flush()?;
-        let op = self.index.get(&key);
-        let p = match op {
-            Some(p) => p.clone(),
-            None => {
-                return Ok(None);
-            }
-        };
-        let mut file = fs::File::open(&self.datafile)?;
-        file.seek(io::SeekFrom::Start(p))?;
-        let mut stream = serde_json::Deserializer::from_reader(&file).into_iter::<Command>();
-        let command = match stream.next() {
-            Some(result) => result?,
-            None => return Err(Error::UnexpectedError),
-        };
-
-        if let Command::Set { key: k, value: v } = command {
-            if k != key {
-                Ok(None)
-            } else {
-                Ok(Some(v))
-            }
-        } else {
-            Err(Error::UnexpectedError)
-        }
+        do_get(&self.index, &self.datafile, key)
     }
 
     /// Remove a value by key.
@@ -98,16 +82,105 @@ impl KvStore {
                 let command = Command::Remove { key };
                 serde_json::to_writer(&mut self.writer, &command)?;
                 if let Command::Remove { key } = command {
-                    self.index.remove(&key);
+                    if let Some(_) = self.index.remove(&key) {
+                        self.num_dead_keys += 1;
+                        self.compact()?;
+                    }
                 }
                 Ok(())
             }
             None => Err(Error::KeyNotFound),
         }
     }
+
+    fn compact(&mut self) -> Result<()> {
+        let dead_keys_ratio = self.num_dead_keys as f64 / self.index.len() as f64;
+        if dead_keys_ratio > COMPACTION_DEAD_KEYS_RATIO {
+            self._compact()?;
+        }
+        Ok(())
+    }
+
+    // TODO need some refactor and address those questions from project-2 about file handling managment and copying.
+    // TODO try to split data into multiple files and only compaction inactive files.
+    fn _compact(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        // Overwrite the data file with new bunch of Command::Set commands based on current index in memory
+        let mut buf = Vec::new();
+        let mut index = BTreeMap::new();
+        let mut writer = PositionedWriter {
+            w: &mut buf,
+            offset: 0,
+        };
+        let mut offset = 0;
+        for key in self.index.keys() {
+            let command = Command::Set {
+                key: key.to_owned(),
+                value: do_get(&self.index, &self.datafile, key.to_owned())?.unwrap(),
+            };
+            serde_json::to_writer(&mut writer, &command)?;
+            // Update index keys with new offset
+            index.insert(key.to_owned(), offset);
+            offset = writer.offset;
+        }
+        self.index = index;
+        // Update data file content
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&self.datafile)?;
+
+        // Update writer
+        self.writer = PositionedWriter {
+            w: io::BufWriter::new(file),
+            offset: 0,
+        };
+        self.writer.write_all(buf.as_ref())?;
+        Ok(())
+    }
 }
 
-fn build_index(datafile: impl AsRef<Path>, index: &mut BTreeMap<String, u64>) -> Result<()> {
+fn do_get(
+    index: &BTreeMap<String, u64>,
+    datafile: impl AsRef<Path>,
+    key: String,
+) -> Result<Option<String>> {
+    let op = index.get(&key);
+    let p = match op {
+        Some(p) => p.clone(),
+        None => {
+            return Ok(None);
+        }
+    };
+    let mut file = fs::File::open(datafile)?;
+    file.seek(io::SeekFrom::Start(p))?;
+    let mut stream = serde_json::Deserializer::from_reader(&file).into_iter::<Command>();
+    let command = match stream.next() {
+        Some(result) => result?,
+        None => {
+            return Err(Error::UnexpectedError(format!(
+                "no command from offset {}",
+                p
+            )))
+        }
+    };
+
+    if let Command::Set { key: k, value: v } = command {
+        if k != key {
+            Ok(None)
+        } else {
+            Ok(Some(v))
+        }
+    } else {
+        Err(Error::UnexpectedError(
+            "read command is a not Command::Set".to_owned(),
+        ))
+    }
+}
+
+fn build_index(datafile: impl AsRef<Path>, index: &mut BTreeMap<String, u64>) -> Result<u64> {
+    let mut num_dead_keys = 0;
     let mut file = fs::File::open(datafile)?;
     let mut stream = serde_json::Deserializer::from_reader(&mut file).into_iter::<Command>();
     let mut offset = stream.byte_offset() as u64;
@@ -115,15 +188,21 @@ fn build_index(datafile: impl AsRef<Path>, index: &mut BTreeMap<String, u64>) ->
         let command = command?;
         match command {
             Command::Set { key, .. } => {
-                index.insert(key, offset as u64);
+                if let Some(_) = index.insert(key, offset as u64) {
+                    num_dead_keys += 1;
+                }
             }
             Command::Remove { key } => {
-                index.remove(&key);
+                if let Some(_) = index.remove(&key) {
+                    num_dead_keys += 1;
+                }
+                // Because the remove command will always be deleted in a compaction.
+                num_dead_keys += 1;
             }
         }
         offset = stream.byte_offset() as u64;
     }
-    Ok(())
+    Ok(num_dead_keys)
 }
 
 /// PositionedWriter tracks the current writing position as a offset in bytes from the start of the stream.
@@ -162,8 +241,8 @@ pub enum Error {
     #[error("Key not found")]
     KeyNotFound,
     /// Unexpected error.
-    #[error("Unexpected error")]
-    UnexpectedError,
+    #[error("Unexpected error: {0}")]
+    UnexpectedError(String),
 }
 
 #[cfg(test)]
